@@ -1,0 +1,375 @@
+# Unique name for this workflow
+name: CI on PR
+
+# Definition when the workflow should run
+on:
+    workflow_dispatch:
+        inputs:
+            prerelease:
+                description: 'Run on a prerelease org?'
+                required: false
+                type: boolean
+    pull_request:
+        types: [opened, edited, synchronize, reopened]
+
+# Workflow environment variables
+env:
+    # Is the PR base branch a prerelease branch
+    IS_PRERELEASE: ${{ startsWith(github.event.pull_request.base.ref, 'prerelease/') || inputs.prerelease  }}
+
+# Jobs to be executed
+jobs:
+    # Dummy job used to skip CI run on automated PRs
+    skip-ci:
+        if: github.actor == 'trailheadapps-bot'
+        runs-on: trailheadapps-Ubuntu
+        steps:
+            - name: Noop
+              run: |
+                  echo "Skipping CI run for automated PRs."
+
+    # Formatting and linting only runs on human-submitted PRs
+    format-lint-lwc-tests:
+        if: github.actor != 'trailheadapps-bot'
+        runs-on: trailheadapps-Ubuntu
+        steps:
+            # Checkout the source code
+            - name: 'Checkout source code'
+              uses: actions/checkout@v7.0.0
+
+            # Check for hardcoded username in XP cloud config
+            - name: 'Check for hardcoded username in XP cloud config'
+              run: |
+                  fileToCheck="cc-site/main/default/sites/Coral_Cloud.site-meta.xml"
+                  if grep -q siteAdmin $fileToCheck; then
+                      echo "siteAdmin tag detected in $fileToCheck. Remove the tag to fix this.";
+                      exit 1;
+                  fi
+                  if grep -q siteGuestRecordDefaultOwner $fileToCheck; then
+                      echo "siteGuestRecordDefaultOwner tag detected in $fileToCheck. Remove the tag to fix this.";
+                      exit 1;
+                  fi
+
+            # Install Volta to enforce proper node and package manager versions
+            - name: 'Install Volta'
+              uses: volta-cli/action@v5.0.0
+
+            # Cache node_modules to speed up the process
+            - name: 'Restore node_modules cache'
+              id: cache-npm
+              uses: actions/cache@v6.0.0
+              with:
+                  path: node_modules
+                  key: npm-${{ hashFiles('**/package-lock.json') }}
+                  restore-keys: |
+                      npm-${{ env.cache-name }}-
+                      npm-
+
+            # Install npm dependencies for Prettier and Jest
+            - name: 'Install npm dependencies'
+              if: steps.cache-npm.outputs.cache-hit != 'true'
+              run: HUSKY=0 npm ci
+
+            # Prettier formatting
+            - name: 'Code formatting verification with Prettier'
+              run: npm run prettier:verify
+
+            # Install Salesforce CLI
+            - name: 'Install Salesforce CLI'
+              run: |
+                  npm install @salesforce/cli --location=global
+                  nodeInstallPath=$(npm config get prefix)
+                  echo "$nodeInstallPath/bin" >> $GITHUB_PATH
+                  cd "$nodeInstallPath/bin"
+                  ./sf --version
+
+            # Install Salesforce CLI Code Analyzer plugin
+            - name: 'Install Salesforce CLI Code Analyzer plugin'
+              run: sf plugins install code-analyzer
+
+            # Run Code Analyzer
+            - name: 'Run Code Analyzer'
+              id: run-code-analyzer
+              uses: forcedotcom/run-code-analyzer@v2.12.0
+              with:
+                  run-arguments: --workspace "cc-*/**" --view detail --output-file "sca-results.csv" --config-file "code-analyzer.yml"
+                  results-artifact-name: code-analyzer-results
+                  github-token: ${{ github.token }}
+
+            # Check for Code Analyzer critical or high severity violations
+            - name: 'Check for Code Analyzer critical or high severity violations'
+              if: |
+                  steps.run-code-analyzer.outputs.exit-code > 0 ||
+                  steps.run-code-analyzer.outputs.num-sev1-violations > 0 ||
+                  steps.run-code-analyzer.outputs.num-sev2-violations > 0
+              run: |
+                  echo One of more Code Analyzer critical or high severity violations found
+                  exit 1
+
+            # LWC unit tests
+            - name: 'Unit test Lightning Web Components'
+              run: npm run test:unit:coverage
+
+            # Upload code coverage data
+            - name: 'Upload code coverage for LWC to Codecov.io'
+              uses: codecov/codecov-action@v7.0.0
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  flags: LWC
+
+    # Auto merge Dependabot PRs for:
+    # - patch updates on prod dependencies
+    # - minor updates on dev dependencies
+    dependabot-auto-merge:
+        # Only run for Dependabot PRs
+        if: github.actor == 'dependabot[bot]'
+        runs-on: trailheadapps-Ubuntu
+        needs: format-lint-lwc-tests
+        permissions:
+            pull-requests: write
+            contents: write
+        steps:
+            - name: 'Fetch Dependabot metadata'
+              id: dependabot
+              uses: dependabot/fetch-metadata@v3.1.0
+
+            - name: 'Check auto merge conditions'
+              id: auto-merge
+              if: |
+                  (
+                    steps.dependabot.outputs.update-type == 'version-update:semver-patch' &&
+                    contains('direct:production,indirect:production', steps.dependabot.outputs.dependency-type)
+                  ) || (
+                    contains('version-update:semver-minor,version-update:semver-patch', steps.dependabot.outputs.update-type) &&
+                    contains('direct:development,indirect:development', steps.dependabot.outputs.dependency-type)
+                  )
+              run: echo "::notice ::auto-merge conditions satisfied"
+
+            - name: 'Approve and merge PR'
+              if: steps.auto-merge.conclusion == 'success'
+              run: |
+                  gh pr review --approve "$PR_URL"
+                  gh pr merge --auto --rebase "$PR_URL"
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PR_URL: ${{ github.event.pull_request.html_url }}
+
+    scratch-org-test:
+        runs-on: trailheadapps-Ubuntu
+        needs: format-lint-lwc-tests
+        if: github.actor != 'dependabot[bot]'
+        steps:
+            # Checkout the source code
+            - name: 'Checkout source code'
+              uses: actions/checkout@v7.0.0
+
+            # Install Salesforce CLI
+            - name: 'Install Salesforce CLI'
+              run: |
+                  npm install @salesforce/cli --location=global
+                  nodeInstallPath=$(npm config get prefix)
+                  echo "$nodeInstallPath/bin" >> $GITHUB_PATH
+                  sf --version
+
+            # Store secret for dev hub
+            - name: 'Populate auth file with DEVHUB_SFDX_URL secret'
+              shell: bash
+              run: |
+                  echo ${{ secrets.DEVHUB_SFDX_URL }} > ./DEVHUB_SFDX_URL.txt
+                  secretFileSize=$(wc -c "./DEVHUB_SFDX_URL.txt" | awk '{print $1}')
+                  if [ $secretFileSize == 1 ]; then
+                      echo "Missing DEVHUB_SFDX_URL secret. Is this workflow running on a fork?";
+                      exit 1;
+                  fi
+
+            # Authenticate dev hub
+            - name: 'Authenticate Dev Hub'
+              run: sf org login sfdx-url -f ./DEVHUB_SFDX_URL.txt -a devhub -d
+
+            # Create prerelease scratch org
+            - name: 'Create prerelease scratch org'
+              if: ${{ env.IS_PRERELEASE }}
+              run: sf org create scratch -f config/project-scratch-def.json -a scratch-org -d -y 1 -w 10 --release=preview
+
+            # Create scratch org
+            - name: 'Create scratch org'
+              if: ${{ !env.IS_PRERELEASE }}
+              run: sf org create scratch -f config/project-scratch-def.json -a scratch-org -d -y 1 -w 10
+
+            # Push base source to scratch org
+            - name: 'Push base source to scratch org'
+              run: sf project deploy start -d cc-base-app
+
+            # Assign Prompt Template Manager permission set
+            - name: 'Assign Prompt Template Manager permission set'
+              run: sf org assign permset -n EinsteinGPTPromptTemplateManager
+
+            # Staged deploy to satisfy prompt-template dependencies:
+            # 1. Apex classes — prompt templates resolve their Apex data
+            #    providers (e.g. apex://PersonalizedGuestExperiences)
+            # 2. Prompt templates — must be committed before the FlexiPage
+            #    and Flow that reference them can be validated
+            # 3. Full employee app — remaining components now resolve
+            - name: 'Push employee Apex classes to scratch org'
+              run: sf project deploy start -d cc-employee-app/main/default/classes
+
+            - name: 'Push prompt templates to scratch org'
+              run: sf project deploy start -d cc-employee-app/main/default/genAiPromptTemplates
+
+            # Push employee source to scratch org
+            - name: 'Push employee source to scratch org'
+              run: sf project deploy start -d cc-employee-app
+
+            # Assign Coral Cloud permission sets
+            - name: 'Assign Coral Cloud permission sets to default user'
+              run: |
+                  sf org assign permset -n Coral_Cloud_Admin
+                  sf org assign permset -n Coral_Cloud_Employee_Agent_Access
+
+            # Import sample data
+            - name: 'Import sample data'
+              run: sf data tree import -p ./data/data-plan.json
+
+            # Run Apex tests in scratch org
+            - name: 'Run Apex tests'
+              run: sf apex test run -c -r human -d ./tests/apex -w 20
+
+            # Upload code coverage data
+            - name: 'Upload code coverage for Apex to Codecov.io'
+              uses: codecov/codecov-action@v7.0.0
+              with:
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  flags: Apex
+
+            # Prepare environment variables for service deployment
+            - name: 'Prepare environment variables for service deployment'
+              run: |
+                  echo "Exporting username and org domain for use in scripts:"
+
+                  # Username
+                  SF_CC_PLACEHOLDER_USERNAME=$(sf org display --json | grep -o '"username": "[^"]*' | cut -d'"' -f4)
+                  if [ -z "${SF_CC_PLACEHOLDER_USERNAME}" ]; then
+                      echo "Installation failed: could not retrieve username."
+                      exit 1
+                  fi
+                  echo "- Username: $SF_CC_PLACEHOLDER_USERNAME"
+                  echo "SF_CC_PLACEHOLDER_USERNAME=$SF_CC_PLACEHOLDER_USERNAME" >> $GITHUB_ENV
+
+                  # Domain
+                  SF_CC_PLACEHOLDER_DOMAIN=$(sf org display --json | grep -o '"instanceUrl": "https[^"]*' | cut -d'"' -f4 | sed -E 's|https?://([^\.]+).*|\1|')
+                  if [ -z "${SF_CC_PLACEHOLDER_DOMAIN}" ]; then
+                      echo "Installation failed: could not retrieve domain."
+                      exit 1
+                  fi
+                  echo "- Domain: $SF_CC_PLACEHOLDER_DOMAIN"
+                  echo "SF_CC_PLACEHOLDER_DOMAIN=$SF_CC_PLACEHOLDER_DOMAIN" >> $GITHUB_ENV
+
+                  # Set dummy values for flow deployment
+                  echo "Setting dummy values for flow deployment"
+                  echo "SF_CC_PLACEHOLDER_FLOW_AGENT_ID=DummyForInitialDeploy" >> $GITHUB_ENV
+                  echo "SF_CC_PLACEHOLDER_FLOW_CHANNEL_ID=DummyForInitialDeploy" >> $GITHUB_ENV
+                  echo "SF_CC_PLACEHOLDER_FLOW_QUEUE_ID=DummyForInitialDeploy" >> $GITHUB_ENV
+
+            # Push Experience Cloud site source
+            - name: 'Push Experience Cloud site source'
+              run: sf project deploy start -d cc-site
+
+            # Push Service Agent Setup source
+            - name: 'Push Service Agent Setup source'
+              run: sf project deploy start -d cc-service-app/main/setup/classes/SetupServiceAgentUser.cls -d cc-service-app/main/default/permissionSets/Coral_Cloud_Service_Agent.permissionset-meta.xml
+
+            # Setup Service Agent user
+            - name: 'Setup Service Agent user'
+              run: sf apex run -f apex-scripts/setup-agent-user.apex
+
+            # Push service app source
+            - name: 'Push service app source'
+              run: sf project deploy start -d cc-service-app
+
+            # Read flow values (Agent ID, Channel ID, Queue ID) from org
+            - name: 'Read flow values (Agent ID, Channel ID, Queue ID) from org'
+              run: |
+                  echo "Reading flow values from org..."
+
+                  # Agent ID
+                  SF_CC_PLACEHOLDER_FLOW_AGENT_ID=$(sf data query --query "SELECT Id from BotDefinition WHERE DeveloperName='Coral_Cloud_Agent'" --json | grep -o '"Id": "[^"]*' | cut -d'"' -f4)
+                  if [ -z "${SF_CC_PLACEHOLDER_FLOW_AGENT_ID}" ] || [ "${SF_CC_PLACEHOLDER_FLOW_AGENT_ID}" = "DummyForInitialDeploy" ]; then
+                      echo "Installation failed: could not retrieve agent ID."
+                      exit 1
+                  fi
+                  echo "- Agent ID: $SF_CC_PLACEHOLDER_FLOW_AGENT_ID"
+                  echo "SF_CC_PLACEHOLDER_FLOW_AGENT_ID=$SF_CC_PLACEHOLDER_FLOW_AGENT_ID" >> $GITHUB_ENV
+
+                  # Channel ID
+                  SF_CC_PLACEHOLDER_FLOW_CHANNEL_ID=$(sf data query --query "SELECT Id from ServiceChannel WHERE DeveloperName='sfdc_livemessage'" --json | grep -o '"Id": "[^"]*' | cut -d'"' -f4)
+                  if [ -z "${SF_CC_PLACEHOLDER_FLOW_CHANNEL_ID}" ] || [ "${SF_CC_PLACEHOLDER_FLOW_CHANNEL_ID}" = "DummyForInitialDeploy" ]; then
+                      echo "Installation failed: could not retrieve channel ID."
+                      exit 1
+                  fi
+                  echo "- Channel ID: $SF_CC_PLACEHOLDER_FLOW_CHANNEL_ID"
+                  echo "SF_CC_PLACEHOLDER_FLOW_CHANNEL_ID=$SF_CC_PLACEHOLDER_FLOW_CHANNEL_ID" >> $GITHUB_ENV
+
+                  # Queue ID
+                  SF_CC_PLACEHOLDER_FLOW_QUEUE_ID=$(sf data query --query "SELECT Id FROM Group WHERE Type = 'Queue' AND Name = 'Messaging Queue'" --json | grep -o '"Id": "[^"]*' | cut -d'"' -f4)
+                  if [ -z "${SF_CC_PLACEHOLDER_FLOW_QUEUE_ID}" ] || [ "${SF_CC_PLACEHOLDER_FLOW_QUEUE_ID}" = "DummyForInitialDeploy" ]; then
+                      echo "Installation failed: could not retrieve queue ID."
+                      exit 1
+                  fi
+                  echo "- Queue ID: $SF_CC_PLACEHOLDER_FLOW_QUEUE_ID"
+                  echo "SF_CC_PLACEHOLDER_FLOW_QUEUE_ID=$SF_CC_PLACEHOLDER_FLOW_QUEUE_ID" >> $GITHUB_ENV
+
+            # Redeploy flow metadata with org-specific values
+            - name: 'Redeploy flow metadata with org-specific values'
+              run: sf project deploy start -d cc-service-app/main/default/flows/Route_to_Agent.flow-meta.xml cc-service-app/main/default/flows/Route_to_Queue.flow-meta.xml
+
+            # Publish Experience Cloud site
+            - name: 'Publish Experience Cloud site'
+              run: sf community publish --name 'coral cloud'
+
+            # Deploy guest profile for Experience Cloud site
+            - name: 'Deploy guest profile for Experience Cloud site'
+              run: sf project deploy start --metadata-dir=guest-profile-metadata -w 10
+
+            # Activate messaging channel
+            - name: 'Activate messaging channel'
+              run: sf apex run -f apex-scripts/activate-messaging-channel.apex
+
+            # Housekeeping
+            - name: 'Delete scratch org'
+              if: always()
+              run: sf org delete scratch -p -o scratch-org
+
+    trigger-packaging:
+        runs-on: trailheadapps-Ubuntu
+        needs: scratch-org-test
+        steps:
+            # Checkout the source code
+            - name: 'Checkout source code'
+              uses: actions/checkout@v7.0.0
+
+            # Check for package changes using git diff
+            - name: 'Check for package changes'
+              id: checkForChanges
+              run: |
+                  git fetch origin $GITHUB_BASE_REF --depth=1
+                  changedPaths=$( git diff-tree --name-only origin/$GITHUB_BASE_REF $GITHUB_SHA )
+                  set +e
+                  hasBasePackageChanges='false'
+                  hasSitePackageChanges='false'
+                  if [ $(echo "$changedPaths" | grep -c '^cc-base-app') == 1 ]; then
+                      hasBasePackageChanges='true'
+                  fi
+                  if [ $(echo "$changedPaths" | grep -c '^cc-site') == 1 ]; then
+                      hasSitePackageChanges='true'
+                  fi
+                  echo "hasBasePackageChanges=$hasBasePackageChanges" >> $GITHUB_OUTPUT
+                  echo "hasSitePackageChanges=$hasSitePackageChanges" >> $GITHUB_OUTPUT
+
+            # Trigger packaging PR workflow
+            - name: 'Trigger packaging PR workflow if needed'
+              uses: peter-evans/repository-dispatch@v4.0.1
+              if: steps.checkForChanges.outputs.hasChanges == 'true'
+              with:
+                  token: ${{ secrets.BOT_ACCESS_TOKEN }}
+                  event-type: start-packaging-pr
+                  client-payload: '{ "ref": "${{ github.ref }}", "sha": "${{ github.sha }}", "isBasePackageRelease": "${{ steps.checkForChanges.outputs.hasBasePackageChanges }}", "isSitePackageRelease": "${{ steps.checkForChanges.outputs.hasSitePackageChanges }}" }'
